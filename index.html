@@ -10,9 +10,9 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script type="module">
     import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
-    import { getFirestore, doc, setDoc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+    import { getFirestore, doc, setDoc, onSnapshot, runTransaction, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
     import { getAuth, signInAnonymously, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-    window.__FIREBASE_SDK__ = { initializeApp, getFirestore, doc, setDoc, onSnapshot, getAuth, signInAnonymously, onAuthStateChanged };
+    window.__FIREBASE_SDK__ = { initializeApp, getFirestore, doc, setDoc, onSnapshot, runTransaction, getDoc, getAuth, signInAnonymously, onAuthStateChanged };
     window.dispatchEvent(new Event("firebase-sdk-ready"));
   </script>
   <style>
@@ -100,6 +100,11 @@
     let reportMonth = currentMonthStr();
     let syncStatus = "Yerel Mod";
     let cloudUnsub = null;
+    let cloudApp = null;
+    let cloudDb = null;
+    let cloudAuth = null;
+    let cloudRoomRef = null;
+    let cloudConnecting = false;
     let chartWeekly = null;
     let chartMonthlyWeeks = null;
 
@@ -108,83 +113,128 @@
       localStorage.setItem("ortak_finans_active_partner", activePartner);
     }
 
-    async function pushCloud(nextState) {
-      const cfgText = (nextState.cloudConfig?.firebaseJson || "").trim();
-      const roomId = (nextState.cloudConfig?.roomId || "sirket-odasi-01").trim();
-      if (!cfgText || !window.__FIREBASE_SDK__) return;
-      try {
-        syncStatus = "Buluta Kaydediliyor...";
-        render();
-        const cfg = JSON.parse(cfgText);
-        const { initializeApp, getFirestore, doc, setDoc, getAuth, signInAnonymously } = window.__FIREBASE_SDK__;
-        const appName = "room_" + roomId.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const app = initializeApp(cfg, appName);
-        const db = getFirestore(app);
-        const auth = getAuth(app);
-        if (!auth.currentUser) await signInAnonymously(auth);
-        const payload = {
-          partners: nextState.partners,
-          revenues: nextState.revenues,
-          expenses: nextState.expenses,
-          scheduledPayments: nextState.scheduledPayments,
-          capitalMovements: nextState.capitalMovements,
-          updatedAt: new Date().toISOString()
-        };
-        await setDoc(doc(db, "rooms", roomId), payload, { merge: true });
-        syncStatus = "Bulut Senkronize (" + roomId + ")";
-      } catch (err) {
-        syncStatus = "Bulut Hatası: " + (err.message || "Bağlantı yok");
-      }
+    function cloudPayload(source) {
+      return {
+        partners: source.partners || [],
+        revenues: source.revenues || [],
+        expenses: source.expenses || [],
+        scheduledPayments: source.scheduledPayments || [],
+        capitalMovements: source.capitalMovements || [],
+        updatedAt: new Date().toISOString()
+      };
     }
 
-    function connectCloudListener() {
+    function applyCloudData(data) {
+      state = {
+        ...state,
+        partners: Array.isArray(data.partners) && data.partners.length === 4 ? data.partners : state.partners,
+        revenues: Array.isArray(data.revenues) ? data.revenues : [],
+        expenses: Array.isArray(data.expenses) ? data.expenses : [],
+        scheduledPayments: Array.isArray(data.scheduledPayments) ? data.scheduledPayments : [],
+        capitalMovements: Array.isArray(data.capitalMovements) ? data.capitalMovements : []
+      };
+      saveLocal();
+    }
+
+    async function connectCloudListener() {
+      if (cloudConnecting) return;
       if (typeof cloudUnsub === "function") {
         cloudUnsub();
         cloudUnsub = null;
       }
+      cloudDb = null;
+      cloudRoomRef = null;
       const cfgText = (state.cloudConfig?.firebaseJson || "").trim();
       const roomId = (state.cloudConfig?.roomId || "sirket-odasi-01").trim();
       if (!cfgText || !window.__FIREBASE_SDK__) {
         syncStatus = "Yerel Depolama (Oda: " + roomId + ")";
+        render();
         return;
       }
+
+      cloudConnecting = true;
+      syncStatus = "Buluta bağlanılıyor...";
+      render();
       try {
         const cfg = JSON.parse(cfgText);
-        const { initializeApp, getFirestore, doc, onSnapshot, getAuth, signInAnonymously } = window.__FIREBASE_SDK__;
-        const appName = "listener_" + roomId.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const app = initializeApp(cfg, appName);
-        const db = getFirestore(app);
-        const auth = getAuth(app);
-        signInAnonymously(auth).then(() => {
-          cloudUnsub = onSnapshot(doc(db, "rooms", roomId), (snap) => {
-            if (snap.exists()) {
-              const d = snap.data();
-              state = {
-                ...state,
-                partners: d.partners || state.partners,
-                revenues: d.revenues || state.revenues,
-                expenses: d.expenses || state.expenses,
-                scheduledPayments: d.scheduledPayments || state.scheduledPayments,
-                capitalMovements: d.capitalMovements || state.capitalMovements
-              };
-              saveLocal();
-              syncStatus = "Canlı Bulut (" + roomId + ")";
-              render();
-            }
-          });
-        }).catch(() => {
-          syncStatus = "Auth Hatası (Yerel Aktif)";
+        const sdk = window.__FIREBASE_SDK__;
+        // Aynı Firebase uygulamasını kullan: ayrı app/auth örnekleri oturum çakışmasına yol açabilir.
+        cloudApp = sdk.initializeApp(cfg, "ortak_finans_shared");
+        cloudDb = sdk.getFirestore(cloudApp);
+        cloudAuth = sdk.getAuth(cloudApp);
+        if (!cloudAuth.currentUser) await sdk.signInAnonymously(cloudAuth);
+        cloudRoomRef = sdk.doc(cloudDb, "rooms", roomId);
+
+        const firstRead = await sdk.getDoc(cloudRoomRef);
+        if (firstRead.exists()) {
+          applyCloudData(firstRead.data());
+          syncStatus = "Bulut bağlı · " + roomId;
+        } else {
+          // İlk bağlantıda bu cihazdaki mevcut kayıtları ilk bulut verisi olarak aktar.
+          await sdk.setDoc(cloudRoomRef, cloudPayload(state));
+          syncStatus = "İlk kayıtlar buluta aktarıldı · " + roomId;
+        }
+
+        cloudUnsub = sdk.onSnapshot(cloudRoomRef, (snap) => {
+          if (snap.exists()) {
+            applyCloudData(snap.data());
+            syncStatus = "Canlı Bulut · " + roomId;
+            render();
+          }
+        }, (err) => {
+          syncStatus = "Bulut dinleme hatası: " + (err.message || "Bağlantı sorunu");
+          render();
         });
-      } catch {
-        syncStatus = "Geçersiz Firebase JSON";
+      } catch (err) {
+        cloudDb = null;
+        cloudRoomRef = null;
+        syncStatus = "Bulut bağlantı hatası: " + (err.message || "Ayarları kontrol edin");
+      } finally {
+        cloudConnecting = false;
+        render();
       }
     }
 
-    function updateAndSync(mutator) {
-      mutator(state);
+    async function updateAndSync(mutator) {
+      // Bulut bağlıysa son sunucu verisini transaction içinde okuyup değiştir.
+      // Böylece farklı cihazlardan eş zamanlı eklenen kayıtların birbirini ezme riski azalır.
+      if (cloudDb && cloudRoomRef && cloudAuth?.currentUser) {
+        try {
+          syncStatus = "Buluta kaydediliyor...";
+          render();
+          const sdk = window.__FIREBASE_SDK__;
+          let committedNext = null;
+          await sdk.runTransaction(cloudDb, async (transaction) => {
+            const snap = await transaction.get(cloudRoomRef);
+            const latest = snap.exists() ? snap.data() : cloudPayload(state);
+            const next = {
+              ...state,
+              partners: latest.partners || state.partners,
+              revenues: latest.revenues || [],
+              expenses: latest.expenses || [],
+              scheduledPayments: latest.scheduledPayments || [],
+              capitalMovements: latest.capitalMovements || []
+            };
+            mutator(next);
+            committedNext = next;
+            transaction.set(cloudRoomRef, cloudPayload(next));
+          });
+          if (committedNext) state = committedNext;
+          saveLocal();
+          syncStatus = "Bulut senkronize";
+          render();
+          return;
+        } catch (err) {
+          // Bağlantı/kural hatasında kullanıcının işlemini en azından bu cihazda kaybetme.
+          mutator(state);
+          syncStatus = "Bulut kayıt hatası · Yerel kaydedildi: " + (err.message || "Bağlantıyı kontrol edin");
+        }
+      } else {
+        mutator(state);
+        syncStatus = "Yerel Mod · Bulut bağlı değil";
+      }
       saveLocal();
       render();
-      pushCloud(state);
     }
 
     function getPartnerDisplayName(partnerId) {
@@ -874,10 +924,9 @@
         saveCloudBtn.addEventListener("click", () => {
           const roomVal = (document.getElementById("roomIdInput")?.value || "sirket-odasi-01").trim();
           const fbVal = (document.getElementById("fbJsonInput")?.value || "").trim();
-          updateAndSync(s => {
-            s.cloudConfig.roomId = roomVal;
-            s.cloudConfig.firebaseJson = fbVal;
-          });
+          state.cloudConfig.roomId = roomVal || "sirket-odasi-01";
+          state.cloudConfig.firebaseJson = fbVal;
+          saveLocal();
           connectCloudListener();
         });
       }
